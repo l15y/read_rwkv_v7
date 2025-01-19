@@ -42,6 +42,22 @@ flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--us
 load(name="wind_backstepping", sources=[f'cuda/wkv7_cuda.cu', 'cuda/wkv7_op.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
 
 class WindBackstepping(torch.autograd.Function):
+    """自定义CUDA内核的封装类
+    
+    实现了RWKV特有的时间注意力机制的高效计算。
+    通过CUDA内核加速，实现了线性复杂度的时间注意力计算。
+    
+    参数：
+        w: 权重矩阵，形状为 (batch_size, seq_len, head_size, head_size)
+        q: 查询矩阵，形状为 (batch_size, seq_len, head_size, head_size)
+        k: 键矩阵，形状为 (batch_size, seq_len, head_size, head_size)
+        v: 值矩阵，形状为 (batch_size, seq_len, head_size, head_size)
+        z: 辅助矩阵1，形状为 (batch_size, seq_len, head_size, head_size)
+        b: 辅助矩阵2，形状为 (batch_size, seq_len, head_size, head_size)
+        
+    返回：
+        torch.Tensor: 计算结果，形状与v相同
+    """
     @staticmethod
     def forward(ctx, w,q,k,v,z,b):
         B,T,H,C = w.shape 
@@ -64,15 +80,54 @@ class WindBackstepping(torch.autograd.Function):
         return dw,dq,dk,dv,dz,db
 
 def RUN_CUDA_RWKV7g(q,w,k,v,a,b):
+    """调用CUDA内核进行RWKV时间注意力计算
+    
+    参数：
+        q: 查询矩阵，形状为 (batch_size, seq_len, hidden_size)
+        w: 权重矩阵，形状为 (batch_size, seq_len, hidden_size)
+        k: 键矩阵，形状为 (batch_size, seq_len, hidden_size)
+        v: 值矩阵，形状为 (batch_size, seq_len, hidden_size)
+        a: 辅助矩阵1，形状为 (batch_size, seq_len, hidden_size)
+        b: 辅助矩阵2，形状为 (batch_size, seq_len, hidden_size)
+        
+    返回：
+        torch.Tensor: 计算结果，形状为 (batch_size, seq_len, hidden_size)
+        
+    实现细节：
+    1. 将输入张量reshape为适合CUDA内核的形状
+    2. 调用WindBackstepping.apply进行计算
+    3. 将结果reshape回原始形状
+    """
     B,T,HC = q.shape
     q,w,k,v,a,b = [i.view(B,T,HC//64,64) for i in [q,w,k,v,a,b]]
     return WindBackstepping.apply(w,q,k,v,a,b).view(B,T,HC)
 
-########################################################################################################
 
 class RWKV_Tmix_x070(MyModule):
     """RWKV 时间混合模块 x070 版本
-    这是模型的核心组件之一，负责处理时间序列数据的混合和特征提取
+    这是模型的核心组件之一，负责处理时间序列数据的混合和特征提取。
+    该模块实现了RWKV架构特有的时间混合机制，结合了RNN和Transformer的优点。
+    
+    主要功能：
+    - 通过时间偏移机制捕捉序列中的时间依赖关系
+    - 使用可学习的参数控制不同特征（接收、键、值等）的混合比例
+    - 实现了一个高效的时间注意力机制，避免了传统Transformer的平方复杂度
+    
+    参数：
+        args: 模型配置参数对象
+        layer_id: 当前层在模型中的索引
+        
+    属性：
+        head_size: 每个注意力头的大小
+        n_head: 注意力头的数量
+        x_r, x_w, x_k, x_v, x_a, x_g: 可学习的时间混合参数
+        w0, w1, w2: 权重计算相关参数
+        a0, a1, a2: 注意力缩放相关参数
+        v0, v1, v2: 值残差连接相关参数
+        g1, g2: 门控机制相关参数
+        time_shift: 时间偏移层
+        receptance, key, value, output: 线性变换层
+        ln_x: 层归一化
     """
     def __init__(self, args, layer_id):
         super().__init__()
@@ -154,20 +209,30 @@ class RWKV_Tmix_x070(MyModule):
             self.output = nn.Linear(C, C, bias=False)
             self.ln_x = nn.GroupNorm(H, C, eps=(1e-5)*(args.head_size_divisor**2)) # !!! notice eps value !!!
 
-            # !!! initialize if you are using RWKV_Tmix_x070 in your code !!!
-            # self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
-            # self.key.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
-            # self.value.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
-            # self.output.weight.data.zero_()
 
     @MyFunction
     def forward(self, x, v_first):
         """前向传播函数
+        
         参数:
             x: 输入张量，形状为 (batch_size, seq_len, hidden_size)
+                包含当前时间步的输入特征
             v_first: 第一层的值向量
+                用于残差连接的特殊值向量，仅在layer_id=0时使用
+                
         返回:
-            处理后的输出和更新后的值向量
+            tuple: 包含两个元素
+                - 输出张量，形状与输入x相同
+                - 更新后的值向量，用于下一层或下一次前向传播
+                
+        实现细节：
+        1. 计算时间偏移特征，捕捉序列中的时间依赖关系
+        2. 使用可学习参数混合不同特征（接收、键、值等）
+        3. 计算注意力权重，应用soft-clamp限制范围
+        4. 处理第一层的特殊情况，更新值向量
+        5. 调用CUDA内核进行高效计算
+        6. 应用层归一化和残差连接
+        7. 使用门控机制控制信息流动
         """
         B, T, C = x.size()  # 获取输入形状：批大小、序列长度、特征维度
         H = self.n_head  # 注意力头数
@@ -231,9 +296,6 @@ class RWKV_CMix_x070(MyModule):
         self.key = nn.Linear(args.n_embd, args.n_embd * 4, bias=False)
         self.value = nn.Linear(args.n_embd * 4, args.n_embd, bias=False)
 
-        # !!! initialize if you are using RWKV_Tmix_x070 in your code !!!
-        # self.key.weight.data.uniform_(-0.5/(args.n_embd**0.5), 0.5/(args.n_embd**0.5))
-        # self.value.weight.data.zero_()
 
     @MyFunction
     def forward(self, x):
@@ -245,12 +307,28 @@ class RWKV_CMix_x070(MyModule):
         return self.value(k)
 
 
-########################################################################################################
-# The RWKV Model with our blocks
-########################################################################################################
-
-
 class Block(nn.Module):
+    """RWKV模型的基本构建块
+    
+    每个Block包含：
+    - 层归一化
+    - 时间混合模块（RWKV_Tmix_x070）
+    - 通道混合模块（RWKV_CMix_x070）
+    - 可选的小注意力机制
+    
+    参数：
+        args: 模型配置参数
+        layer_id: 当前层在模型中的索引
+        
+    属性：
+        ln1, ln2: 层归一化模块
+        ln0: 仅在第一层使用的额外层归一化
+        pos_emb_x, pos_emb_y: 位置编码（如果启用）
+        att: 时间混合模块
+        ffn: 通道混合模块
+        tiny_ln, tiny_q, tiny_k, tiny_v: 小注意力机制相关组件（如果启用）
+        drop0, drop1: dropout层（如果启用）
+    """
     def __init__(self, args, layer_id):
         super().__init__()
         self.args = args
@@ -284,6 +362,29 @@ class Block(nn.Module):
             self.drop1 = nn.Dropout(p = args.dropout)
 
     def forward(self, x, v_first):
+        """Block前向传播
+        
+        参数：
+            x: 输入特征，形状为 (batch_size, seq_len, hidden_size)
+            v_first: 第一层的值向量
+            
+        返回：
+            tuple: 包含两个元素
+                - 输出特征，形状与输入相同
+                - 更新后的值向量
+                
+        计算流程：
+        1. 如果是第一层，应用额外的层归一化
+        2. 通过时间混合模块处理特征
+            - 先对输入进行层归一化
+            - 应用时间混合
+            - 添加残差连接
+        3. 通过通道混合模块处理特征
+            - 先对输入进行层归一化
+            - 应用通道混合
+            - 添加残差连接
+        4. 返回处理后的特征和更新后的值向量
+        """
         if self.layer_id == 0:
             x = self.ln0(x)
 
@@ -312,7 +413,33 @@ class L2Wrap(torch.autograd.Function):
 
 class RWKV(pl.LightningModule):
     """RWKV 主模型类
-    继承自PyTorch Lightning的Module，包含完整的模型架构
+    继承自PyTorch Lightning的Module，包含完整的模型架构。
+    实现了基于RWKV架构的语言模型，结合了RNN和Transformer的优点。
+    
+    主要特点：
+    - 线性复杂度的时间注意力机制
+    - 可扩展的深度架构
+    - 支持多种浮点精度模式（fp32, fp16, bf16）
+    - 集成PyTorch Lightning的训练框架
+    
+    模型结构：
+    1. 输入嵌入层
+    2. 多层RWKV模块堆叠
+    3. 输出层归一化
+    4. 输出投影层
+    
+    参数：
+        args: 模型配置参数对象，包含以下关键参数：
+            - vocab_size: 词汇表大小
+            - n_embd: 嵌入维度
+            - n_layer: 层数
+            - ctx_len: 上下文长度
+            - dim_att: 注意力维度
+            - dim_ffn: 前馈网络维度
+            - head_qk: 头注意力维度
+            - dropout: dropout概率
+            - tiny_att_dim: 小注意力维度
+            - tiny_att_layer: 使用小注意力的层索引
     """
     def __init__(self, args):
         super().__init__()
@@ -361,8 +488,6 @@ class RWKV(pl.LightningModule):
         lr_3x = set()
         for n, p in self.named_parameters():
 
-            # if not p.requires_grad:
-            #     continue
             if args.train_type == 'states':
                 if 'time_sta' not in n:
                     continue
@@ -431,7 +556,6 @@ class RWKV(pl.LightningModule):
             if self.deepspeed_offload:
                 return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
             return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
-        # return ZeroOneAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, weight_decay=0, amsgrad=False, cuda_aware=False)
 
     @property
     def deepspeed_offload(self) -> bool:
@@ -443,10 +567,26 @@ class RWKV(pl.LightningModule):
 
     def forward(self, idx):
         """模型前向传播
+        
         参数:
             idx: 输入token索引，形状为 (batch_size, seq_len)
+                包含要处理的token序列的索引
+                
         返回:
-            模型输出logits
+            torch.Tensor: 模型输出logits，形状为 (batch_size, seq_len, vocab_size)
+                表示每个位置每个token的未归一化对数概率
+                
+        计算流程：
+        1. 检查输入序列长度是否超过模型最大上下文长度
+        2. 将token索引转换为嵌入向量
+        3. 应用dropout（如果启用）
+        4. 通过多层RWKV模块处理特征
+            - 如果启用小注意力机制，使用特殊处理流程
+            - 否则使用标准RWKV处理流程
+        5. 应用最终层归一化
+        6. 计算输出logits
+            - 如果启用头注意力机制，添加额外的注意力输出
+        7. 返回最终logits
         """
         args = self.args
         B, T = idx.size()  # 获取输入形状
@@ -610,9 +750,6 @@ class RWKV(pl.LightningModule):
             elif os.environ["RWKV_FLOAT_MODE"] == "bf16":
                 m[n] = m[n].bfloat16()
             n_params += m[n].numel()
-
-            # if n == "emb.weight":
-            #     print(m[n])
 
         print('model params', n_params)
         gc.collect()
