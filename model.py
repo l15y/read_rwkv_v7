@@ -1,8 +1,9 @@
 ########################################################################################################
-# The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
+# RWKV 语言模型 - https://github.com/BlinkDL/RWKV-LM
+# 这是一个基于Transformer的变体模型，采用RWKV架构
 ########################################################################################################
 
-import os, math, gc, importlib
+import os, math, gc, importlib  # 导入基础库
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -27,17 +28,20 @@ if os.environ["RWKV_JIT_ON"] == "1":
 
 
 ########################################################################################################
-# CUDA Kernel
+# CUDA 内核
+# 这部分代码负责加载和初始化CUDA内核，用于加速模型计算
 ########################################################################################################
 
-from torch.utils.cpp_extension import load
+from torch.utils.cpp_extension import load  # 用于加载自定义CUDA扩展
 
-HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE_A"])
+HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE_A"])  # 从环境变量获取头大小
 
-if 'x070' in os.environ["RWKV_MY_TESTING"]:
-    CHUNK_LEN = 16
+if 'x070' in os.environ["RWKV_MY_TESTING"]:  # 检查测试模式
+    CHUNK_LEN = 16  # 设置块长度
 
+    # 编译标志，用于优化CUDA内核性能
     flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
+    # 加载自定义CUDA内核
     load(name="wind_backstepping", sources=[f'cuda/wkv7_cuda.cu', 'cuda/wkv7_op.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
 
     class WindBackstepping(torch.autograd.Function):
@@ -70,18 +74,22 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
 ########################################################################################################
 
 class RWKV_Tmix_x070(MyModule):
+    """RWKV 时间混合模块 x070 版本
+    这是模型的核心组件之一，负责处理时间序列数据的混合和特征提取
+    """
     def __init__(self, args, layer_id):
         super().__init__()
-        self.args = args
-        self.layer_id = layer_id
-        self.my_testing = args.my_testing
+        self.args = args  # 模型参数
+        self.layer_id = layer_id  # 当前层ID
+        self.my_testing = args.my_testing  # 测试模式标志
 
-        self.head_size = args.head_size_a
-        self.n_head = args.dim_att // self.head_size
-        assert args.dim_att % self.n_head == 0
-        H = self.n_head
-        N = self.head_size
-        C = args.n_embd
+        # 初始化注意力头相关参数
+        self.head_size = args.head_size_a  # 每个注意力头的大小
+        self.n_head = args.dim_att // self.head_size  # 注意力头数量
+        assert args.dim_att % self.n_head == 0  # 确保维度可被头数整除
+        H = self.n_head  # 头数
+        N = self.head_size  # 头大小
+        C = args.n_embd  # 嵌入维度
 
         with torch.no_grad():
             ratio_0_to_1 = layer_id / (args.n_layer - 1)  # 0 to 1
@@ -157,37 +165,56 @@ class RWKV_Tmix_x070(MyModule):
 
     @MyFunction
     def forward(self, x, v_first):
-        B, T, C = x.size()
-        H = self.n_head
+        """前向传播函数
+        参数:
+            x: 输入张量，形状为 (batch_size, seq_len, hidden_size)
+            v_first: 第一层的值向量
+        返回:
+            处理后的输出和更新后的值向量
+        """
+        B, T, C = x.size()  # 获取输入形状：批大小、序列长度、特征维度
+        H = self.n_head  # 注意力头数
+        
+        # 时间偏移计算，用于捕捉时间序列中的模式
         xx = self.time_shift(x) - x
 
-        xr = x + xx * self.x_r
-        xw = x + xx * self.x_w
-        xk = x + xx * self.x_k
-        xv = x + xx * self.x_v
-        xa = x + xx * self.x_a
-        xg = x + xx * self.x_g
+        # 计算不同特征变换
+        xr = x + xx * self.x_r  # 接收特征
+        xw = x + xx * self.x_w  # 权重特征
+        xk = x + xx * self.x_k  # 键特征
+        xv = x + xx * self.x_v  # 值特征
+        xa = x + xx * self.x_a  # 注意力特征
+        xg = x + xx * self.x_g  # 门控特征
 
-        r = self.receptance(xr)
-        w = -F.softplus(-(self.w0 + torch.tanh(xw @ self.w1) @ self.w2)) - 0.5 # soft-clamp to (-inf, -0.5)
-        k = self.key(xk)
-        v = self.value(xv)
+        # 计算各个组件
+        r = self.receptance(xr)  # 接收门
+        w = -F.softplus(-(self.w0 + torch.tanh(xw @ self.w1) @ self.w2)) - 0.5  # 权重计算，使用soft-clamp限制范围
+        k = self.key(xk)  # 键
+        v = self.value(xv)  # 值
+        
+        # 处理第一层特殊情况
         if self.layer_id == 0:
-            v_first = v # store the v of the first layer
+            v_first = v  # 存储第一层的值向量
         else:
-            v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2) # add value residual
-        a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2) # a is "in-context learning rate"
-        g = torch.sigmoid(xg @ self.g1) @ self.g2
+            # 添加值残差连接
+            v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)
+        
+        a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2)  # 计算上下文学习率
+        g = torch.sigmoid(xg @ self.g1) @ self.g2  # 计算门控值
 
+        # 键处理
         kk = k * self.k_k
-        kk = F.normalize(kk.view(B,T,H,-1), dim=-1, p=2.0).view(B,T,C)
-        k = k * (1 + (a-1) * self.k_a)
+        kk = F.normalize(kk.view(B,T,H,-1), dim=-1, p=2.0).view(B,T,C)  # 归一化
+        k = k * (1 + (a-1) * self.k_a)  # 应用注意力缩放
 
+        # 调用CUDA内核进行计算
         x = RUN_CUDA_RWKV7g(r, w, k, v, -kk, kk*a)
+        # 层归一化
         x = self.ln_x(x.view(B * T, C)).view(B, T, C)
 
+        # 残差连接和输出
         x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.r_k).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
-        x = self.output(x * g)
+        x = self.output(x * g)  # 应用门控并输出
         return x, v_first
     
 ########################################################################################################
@@ -381,20 +408,29 @@ class L2Wrap(torch.autograd.Function):
 
 
 class RWKV(pl.LightningModule):
+    """RWKV 主模型类
+    继承自PyTorch Lightning的Module，包含完整的模型架构
+    """
     def __init__(self, args):
         super().__init__()
-        self.args = args
+        self.args = args  # 模型参数
+        
+        # 初始化模型维度参数
         if not hasattr(args, 'dim_att'):
-            args.dim_att = args.n_embd
+            args.dim_att = args.n_embd  # 默认注意力维度等于嵌入维度
         if not hasattr(args, 'dim_ffn'):
             if '-f4' in os.environ["RWKV_MY_TESTING"]:
-                args.dim_ffn = int((args.n_embd * 4) // 32 * 32)
+                args.dim_ffn = int((args.n_embd * 4) // 32 * 32)  # 测试模式下使用4倍维度
             else:
-                args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32) # default = 3.5x emb size            
+                args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32)  # 默认使用3.5倍维度
+            
+        # 初始化小注意力机制参数
         if not hasattr(args, 'tiny_att_layer'):
-            args.tiny_att_layer = -1
+            args.tiny_att_layer = -1  # 默认禁用小注意力
         if not hasattr(args, 'tiny_att_dim'):
-            args.tiny_att_dim = -1
+            args.tiny_att_dim = -1  # 默认小注意力维度
+            
+        # 确保维度是32的倍数，便于硬件优化
         assert args.n_embd % 32 == 0
         assert args.dim_att % 32 == 0
         assert args.dim_ffn % 32 == 0
@@ -503,44 +539,59 @@ class RWKV(pl.LightningModule):
         return False
 
     def forward(self, idx):
+        """模型前向传播
+        参数:
+            idx: 输入token索引，形状为 (batch_size, seq_len)
+        返回:
+            模型输出logits
+        """
         args = self.args
-        B, T = idx.size()
-        assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
+        B, T = idx.size()  # 获取输入形状
+        assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."  # 检查序列长度
 
-        x = self.emb(idx)
-        x_emb = x
+        # 嵌入层
+        x = self.emb(idx)  # 将token索引转换为嵌入向量
+        x_emb = x  # 保存初始嵌入
 
+        # 应用dropout
         if args.dropout > 0:
             x = self.drop0(x)
+
+        # 处理小注意力机制
         if args.tiny_att_dim > 0:
             for block in self.blocks:
-                if args.grad_cp == 1:
+                if args.grad_cp == 1:  # 检查是否使用梯度检查点
                     x = deepspeed.checkpointing.checkpoint(block, x, x_emb)
                 else:
                     x = block(x, x_emb)
         else:
+            # 标准注意力处理
             if 'x070' in os.environ["RWKV_MY_TESTING"]:
-                v_first = torch.empty_like(x)
+                v_first = torch.empty_like(x)  # 初始化值向量
                 for block in self.blocks:
                     if args.grad_cp == 1:
                         x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
                     else:
                         x, v_first = block(x, v_first)
             else:
+                # 普通模式
                 for block in self.blocks:
                     if args.grad_cp == 1:
                         x = deepspeed.checkpointing.checkpoint(block, x)
                     else:
                         x = block(x)
 
+        # 最终层归一化
         x = self.ln_out(x)
 
+        # 处理头注意力
         if args.head_qk > 0:
-            q = self.head_q(x)[:, :T, :]
-            k = self.head_k(x)[:, :T, :]
-            c = (q @ k.transpose(-2, -1)) * (1.0 / args.head_qk)
-            c = c.masked_fill(self.copy_mask[:T, :T] == 0, 0)
+            q = self.head_q(x)[:, :T, :]  # 查询
+            k = self.head_k(x)[:, :T, :]  # 键
+            c = (q @ k.transpose(-2, -1)) * (1.0 / args.head_qk)  # 计算注意力分数
+            c = c.masked_fill(self.copy_mask[:T, :T] == 0, 0)  # 应用掩码
 
+            # 根据浮点模式处理输出
             if "32" in os.environ["RWKV_FLOAT_MODE"]:
                 c = c @ F.one_hot(idx, num_classes=args.vocab_size)
             elif os.environ["RWKV_FLOAT_MODE"] == "fp16":
@@ -548,11 +599,11 @@ class RWKV(pl.LightningModule):
             elif os.environ["RWKV_FLOAT_MODE"] == "bf16":
                 c = c @ F.one_hot(idx, num_classes=args.vocab_size).bfloat16()
 
-            x = self.head(x) + c
+            x = self.head(x) + c  # 添加注意力输出
         else:
-            x = self.head(x)
+            x = self.head(x)  # 普通输出
 
-        return x
+        return x  # 返回最终logits
 
     def training_step(self, batch, batch_idx):
         args = self.args
