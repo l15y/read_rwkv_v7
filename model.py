@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import pytorch_lightning as pl
-from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
 if importlib.util.find_spec('deepspeed'):
     import deepspeed
@@ -507,17 +506,10 @@ class RWKV(pl.LightningModule):
             idx, targets = batch
             logits = self(idx)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            # if '0' in os.environ["RWKV_MY_TESTING"]:
-            #     print('logits', logits)
-            #     torch.set_printoptions(threshold=10000)
-            #     print('idx', idx)
-            #     exit(0)
         else:
             idx, targets, mask = batch
             mask = mask.view(-1)
             sum_mask = torch.sum(mask).item()
-            # if sum_mask == 0:
-            #     return torch.tensor([0.0], requires_grad=True)
 
             logits = self(idx)
             if sum_mask == mask.shape[0]:
@@ -525,20 +517,7 @@ class RWKV(pl.LightningModule):
                 # print('rank', self.global_rank, 'loss', loss.item())
             else:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
-                # loss_raw = loss
                 loss = torch.sum(loss * mask) / sum_mask
-
-                # torch.set_printoptions(threshold=10000)
-                # if True: #self.global_rank == 1:
-                #     tmp = ''
-                #     sss = 0
-                #     ccc = 0
-                #     for i in range(mask.shape[0]):
-                #         if mask[i] > 0:
-                #             tmp += str(idx.view(-1)[i].item()) + ','
-                #             sss += loss_raw.view(-1)[i].float().item()
-                #             ccc += 1
-                #     print('rank', self.global_rank, 'loss', loss.item(), 'lavg', sss / ccc)#, 'tmp', tmp, 'input', idx)
 
         return L2Wrap.apply(loss, logits)
 
@@ -592,51 +571,38 @@ class RWKV(pl.LightningModule):
                 nn.init.orthogonal_(m[n], gain=scale)
                 print(f" [scale {scale}]")
             else:
-                if 'mamba' in os.environ["RWKV_MY_TESTING"]:
-                    m[n] = p
-                    if '.out_proj.weight' in n:
-                        scale = 0
-                        nn.init.zeros_(m[n])
-                        print(f" [scale {scale}]")
-                    elif '.bias' in n:
-                        scale = 0
-                        nn.init.zeros_(m[n])
-                        print(f" [scale {scale}]")
-                    else:
-                        print()
-                else:
-                    assert n.endswith('.weight') # should always be true
+                assert n.endswith('.weight') # should always be true
 
-                    zero = [".att.output.", ".ffn.value.", ".ffn.receptance.", ".ffnPre.value.", ".ffnPre.receptance.", "head_q.", '.oo.', '.rr.']
+                zero = [".att.output.", ".ffn.value.", ".ffn.receptance.", ".ffnPre.value.", ".ffnPre.receptance.", "head_q.", '.oo.', '.rr.']
 
-                    for kk in zero:
-                        if kk in n:
-                            scale = 0
-                    if "head_k." in n:
+                for kk in zero:
+                    if kk in n:
+                        scale = 0
+                if "head_k." in n:
+                    scale = 0.1
+                if "head_q." in n:
+                    scale = 0
+
+                for kk in [".att.key."]:
+                    if kk in n:
                         scale = 0.1
-                    if "head_q." in n:
-                        scale = 0
+                for kk in [".att.gate."]:
+                    if kk in n:
+                        scale = 0.1
 
-                    for kk in [".att.key."]:
-                        if kk in n:
-                            scale = 0.1
-                    for kk in [".att.gate."]:
-                        if kk in n:
-                            scale = 0.1
+                print(f" [scale {scale}]")
 
-                    print(f" [scale {scale}]")
+                if self.args.accelerator.upper() == "GPU":
+                    m[n] = torch.empty((shape[0], shape[1]), device="cuda")
+                else:
+                    m[n] = torch.empty((shape[0], shape[1]))
 
-                    if self.args.accelerator.upper() == "GPU":
-                        m[n] = torch.empty((shape[0], shape[1]), device="cuda")
-                    else:
-                        m[n] = torch.empty((shape[0], shape[1]))
-
-                    if scale == 0:
-                        nn.init.zeros_(m[n])
-                    elif scale < 0:
-                        nn.init.uniform_(m[n], a=scale, b=-scale)
-                    else:
-                        nn.init.orthogonal_(m[n], gain=scale)
+                if scale == 0:
+                    nn.init.zeros_(m[n])
+                elif scale < 0:
+                    nn.init.uniform_(m[n], a=scale, b=-scale)
+                else:
+                    nn.init.orthogonal_(m[n], gain=scale)
 
             m[n] = m[n].cpu()
             if os.environ["RWKV_FLOAT_MODE"] == "fp16":
