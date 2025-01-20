@@ -1,6 +1,6 @@
 ########################################################################################################
+# https://github.com/l15y/read_rwkv_v7/tree/main
 # RWKV 语言模型 - https://github.com/BlinkDL/RWKV-LM
-# 这是一个基于Transformer的变体模型，采用RWKV架构
 ########################################################################################################
 
 import os, math, gc, importlib  # 导入基础库
@@ -60,23 +60,46 @@ class WindBackstepping(torch.autograd.Function):
     """
     @staticmethod
     def forward(ctx, w,q,k,v,z,b):
-        B,T,H,C = w.shape 
-        assert T%CHUNK_LEN == 0
-        assert all(i.dtype==torch.bfloat16 for i in [w,q,k,v,z,b])
-        assert all(i.is_contiguous() for i in [w,q,k,v,z,b])
-        y = torch.empty_like(v)
-        s = torch.empty(B,H,T//CHUNK_LEN,C,C, dtype=torch.float32,device=w.device)
-        sa = torch.empty(B,T,H,C, dtype=torch.float32,device=w.device)
-        torch.ops.wind_backstepping.forward(w,q,k,v,z,b, y,s,sa)
+        """前向传播函数
+        
+        参数:
+            ctx: 上下文对象，用于保存反向传播所需信息
+            w: 权重矩阵，形状为 (batch_size, seq_len, head_size, head_size)
+            q: 查询矩阵，形状为 (batch_size, seq_len, head_size, head_size)
+            k: 键矩阵，形状为 (batch_size, seq_len, head_size, head_size)
+            v: 值矩阵，形状为 (batch_size, seq_len, head_size, head_size)
+            z: 辅助矩阵1，形状为 (batch_size, seq_len, head_size, head_size)
+            b: 辅助矩阵2，形状为 (batch_size, seq_len, head_size, head_size)
+            
+        返回:
+            torch.Tensor: 计算结果，形状与v相同
+        """
+        B,T,H,C = w.shape  # 获取输入张量的形状：批大小、序列长度、头数、头大小
+        assert T%CHUNK_LEN == 0  # 确保序列长度能被块长度整除
+        assert all(i.dtype==torch.bfloat16 for i in [w,q,k,v,z,b])  # 检查所有输入张量的数据类型
+        assert all(i.is_contiguous() for i in [w,q,k,v,z,b])  # 检查所有输入张量是否连续存储
+        y = torch.empty_like(v)  # 初始化输出张量
+        s = torch.empty(B,H,T//CHUNK_LEN,C,C, dtype=torch.float32,device=w.device)  # 初始化状态张量
+        sa = torch.empty(B,T,H,C, dtype=torch.float32,device=w.device)  # 初始化辅助状态张量
+        torch.ops.wind_backstepping.forward(w,q,k,v,z,b, y,s,sa)  # 调用CUDA内核进行计算
         ctx.save_for_backward(w,q,k,v,z,b,s,sa)
         return y
     @staticmethod
     def backward(ctx, dy):
-        assert all(i.dtype==torch.bfloat16 for i in [dy])
-        assert all(i.is_contiguous() for i in [dy])
-        w,q,k,v,z,b,s,sa = ctx.saved_tensors
-        dw,dq,dk,dv,dz,db = [torch.empty_like(x) for x in [w,q,k,v,z,b]]
-        torch.ops.wind_backstepping.backward(w,q,k,v,z,b, dy,s,sa, dw,dq,dk,dv,dz,db)
+        """反向传播函数
+        
+        参数:
+            ctx: 上下文对象，包含前向传播保存的信息
+            dy: 输出梯度，形状与前向传播的输出相同
+            
+        返回:
+            tuple: 包含各输入参数的梯度
+        """
+        assert all(i.dtype==torch.bfloat16 for i in [dy])  # 检查梯度张量的数据类型
+        assert all(i.is_contiguous() for i in [dy])  # 检查梯度张量是否连续存储
+        w,q,k,v,z,b,s,sa = ctx.saved_tensors  # 获取前向传播保存的张量
+        dw,dq,dk,dv,dz,db = [torch.empty_like(x) for x in [w,q,k,v,z,b]]  # 初始化各参数的梯度张量
+        torch.ops.wind_backstepping.backward(w,q,k,v,z,b, dy,s,sa, dw,dq,dk,dv,dz,db)  # 调用CUDA内核进行反向计算
         return dw,dq,dk,dv,dz,db
 
 def RUN_CUDA_RWKV7g(q,w,k,v,a,b):
@@ -144,7 +167,7 @@ class RWKV_Tmix_x070(MyModule):
         C = args.n_embd  # 嵌入维度
 
         with torch.no_grad():
-            ratio_0_to_1 = layer_id / (args.n_layer - 1)  # 0 to 1
+            ratio_0_to_1 = layer_id / (args.n_layer - 1)  # 0 to 1  # 计算当前层在总层数中的比例
             ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
             ddd = torch.ones(1, 1, C)
             for i in range(C):
@@ -175,9 +198,9 @@ class RWKV_Tmix_x070(MyModule):
             D_DECAY_LORA = max(32, int(round(  (1.8*(C**0.5))  /32)*32)) # suggestion
             self.w1 = nn.Parameter(torch.zeros(C, D_DECAY_LORA))
             self.w2 = nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, C), 0.1))
-            decay_speed = torch.ones(C)
+            decay_speed = torch.ones(C)  # 初始化衰减速度张量
             for n in range(C):
-                decay_speed[n] = -7 + 5 * (n / (C - 1)) ** (0.85 + 1.0 * ratio_0_to_1 ** 0.5)
+                decay_speed[n] = -7 + 5 * (n / (C - 1)) ** (0.85 + 1.0 * ratio_0_to_1 ** 0.5)  # 计算每个维度的衰减速度
             self.w0 = nn.Parameter(decay_speed.reshape(1,1,C) + 0.5) # !!! 0.5 comes from F.softplus !!!
 
             # D_AAA_LORA = 64
@@ -280,6 +303,14 @@ class RWKV_Tmix_x070(MyModule):
         return x, v_first
     
 class RWKV_CMix_x070(MyModule):
+    """RWKV 通道混合模块 x070 版本
+    
+    实现通道间的特征混合，通过非线性变换增强特征表达能力。
+    主要特点：
+    - 使用ReLU激活函数和平方操作增强非线性
+    - 通过线性变换实现特征混合
+    - 支持不同层使用不同的混合参数
+    """
     def __init__(self, args, layer_id):
         super().__init__()
         self.args = args
@@ -308,6 +339,27 @@ class RWKV_CMix_x070(MyModule):
 
 
 class Block(nn.Module):
+    """RWKV模型的基本构建块
+    
+    每个Block包含：
+    - 层归一化
+    - 时间混合模块（RWKV_Tmix_x070）
+    - 通道混合模块（RWKV_CMix_x070）
+    - 可选的小注意力机制
+    
+    参数：
+        args: 模型配置参数
+        layer_id: 当前层在模型中的索引
+        
+    属性：
+        ln1, ln2: 层归一化模块
+        ln0: 仅在第一层使用的额外层归一化
+        pos_emb_x, pos_emb_y: 位置编码（如果启用）
+        att: 时间混合模块
+        ffn: 通道混合模块
+        tiny_ln, tiny_q, tiny_k, tiny_v: 小注意力机制相关组件（如果启用）
+        drop0, drop1: dropout层（如果启用）
+    """
     """RWKV模型的基本构建块
     
     每个Block包含：
@@ -395,6 +447,13 @@ class Block(nn.Module):
         return x, v_first
 
 class L2Wrap(torch.autograd.Function):
+    """L2正则化封装类
+    
+    实现自定义的L2正则化计算，用于鼓励logits接近0。
+    主要功能：
+    - 在前向传播中直接返回损失
+    - 在反向传播中计算梯度并应用L2正则化
+    """
     @staticmethod
     def forward(ctx, loss, y):
         ctx.save_for_backward(y)
@@ -412,6 +471,35 @@ class L2Wrap(torch.autograd.Function):
 
 
 class RWKV(pl.LightningModule):
+    """RWKV 主模型类
+    继承自PyTorch Lightning的Module，包含完整的模型架构。
+    实现了基于RWKV架构的语言模型，结合了RNN和Transformer的优点。
+    
+    主要特点：
+    - 线性复杂度的时间注意力机制
+    - 可扩展的深度架构
+    - 支持多种浮点精度模式（fp32, fp16, bf16）
+    - 集成PyTorch Lightning的训练框架
+    
+    模型结构：
+    1. 输入嵌入层
+    2. 多层RWKV模块堆叠
+    3. 输出层归一化
+    4. 输出投影层
+    
+    参数：
+        args: 模型配置参数对象，包含以下关键参数：
+            - vocab_size: 词汇表大小
+            - n_embd: 嵌入维度
+            - n_layer: 层数
+            - ctx_len: 上下文长度
+            - dim_att: 注意力维度
+            - dim_ffn: 前馈网络维度
+            - head_qk: 头注意力维度
+            - dropout: dropout概率
+            - tiny_att_dim: 小注意力维度
+            - tiny_att_layer: 使用小注意力的层索引
+    """
     """RWKV 主模型类
     继承自PyTorch Lightning的Module，包含完整的模型架构。
     实现了基于RWKV架构的语言模型，结合了RNN和Transformer的优点。
@@ -623,7 +711,7 @@ class RWKV(pl.LightningModule):
         if args.head_qk > 0:
             q = self.head_q(x)[:, :T, :]  # 查询
             k = self.head_k(x)[:, :T, :]  # 键
-            c = (q @ k.transpose(-2, -1)) * (1.0 / args.head_qk)  # 计算注意力分数
+            c = (q @ k.transpose(-2, -1)) * (1.0 / args.head_qk)  # 计算注意力分数：查询和键的点积，并缩放
             c = c.masked_fill(self.copy_mask[:T, :T] == 0, 0)  # 应用掩码
 
             # 根据浮点模式处理输出
@@ -645,7 +733,7 @@ class RWKV(pl.LightningModule):
         if args.my_qa_mask != 1:
             idx, targets = batch
             logits = self(idx)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))  # 计算交叉熵损失：预测logits与目标标签
         else:
             idx, targets, mask = batch
             mask = mask.view(-1)
@@ -708,7 +796,7 @@ class RWKV(pl.LightningModule):
                     scale = 0.5 * math.sqrt(self.args.vocab_size / self.args.n_embd)
                 else:
                     scale = 0.5
-                nn.init.orthogonal_(m[n], gain=scale)
+                nn.init.orthogonal_(m[n], gain=scale)  # 使用正交初始化权重矩阵，保持输入输出特征之间的独立性
                 print(f" [scale {scale}]")
             else:
                 assert n.endswith('.weight') # should always be true
