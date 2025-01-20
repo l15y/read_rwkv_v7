@@ -363,10 +363,7 @@ class Block(nn.Module):
                 self.pos_emb_x = nn.Parameter(torch.zeros((1,args.my_pos_emb,args.n_embd)))
                 self.pos_emb_y = nn.Parameter(torch.zeros((args.my_pos_emb,1,args.n_embd)))
 
-        if self.layer_id == 0 and self.args.pre_ffn > 0:
-            self.ffnPre = RWKV_ChannelMix(args, 0)
-        else:
-            self.att = RWKV_Tmix_x070(args, layer_id)
+        self.att = RWKV_Tmix_x070(args, layer_id)
 
         self.ffn = RWKV_CMix_x070(args, layer_id)
         
