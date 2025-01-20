@@ -46,17 +46,6 @@ class WindBackstepping(torch.autograd.Function):
     
     实现了RWKV特有的时间注意力机制的高效计算。
     通过CUDA内核加速，实现了线性复杂度的时间注意力计算。
-    
-    参数：
-        w: 权重矩阵，形状为 (batch_size, seq_len, head_size, head_size)
-        q: 查询矩阵，形状为 (batch_size, seq_len, head_size, head_size)
-        k: 键矩阵，形状为 (batch_size, seq_len, head_size, head_size)
-        v: 值矩阵，形状为 (batch_size, seq_len, head_size, head_size)
-        z: 辅助矩阵1，形状为 (batch_size, seq_len, head_size, head_size)
-        b: 辅助矩阵2，形状为 (batch_size, seq_len, head_size, head_size)
-        
-    返回：
-        torch.Tensor: 计算结果，形状与v相同
     """
     @staticmethod
     def forward(ctx, w,q,k,v,z,b):
@@ -339,27 +328,6 @@ class RWKV_CMix_x070(MyModule):
 
 
 class Block(nn.Module):
-    """RWKV模型的基本构建块
-    
-    每个Block包含：
-    - 层归一化
-    - 时间混合模块（RWKV_Tmix_x070）
-    - 通道混合模块（RWKV_CMix_x070）
-    - 可选的小注意力机制
-    
-    参数：
-        args: 模型配置参数
-        layer_id: 当前层在模型中的索引
-        
-    属性：
-        ln1, ln2: 层归一化模块
-        ln0: 仅在第一层使用的额外层归一化
-        pos_emb_x, pos_emb_y: 位置编码（如果启用）
-        att: 时间混合模块
-        ffn: 通道混合模块
-        tiny_ln, tiny_q, tiny_k, tiny_v: 小注意力机制相关组件（如果启用）
-        drop0, drop1: dropout层（如果启用）
-    """
     """RWKV模型的基本构建块
     
     每个Block包含：
