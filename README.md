@@ -16,24 +16,6 @@
 - CUDA 11.3+ (如需GPU加速)
 - NVIDIA显卡 (如需GPU加速)
 
-## 安装步骤
-1. 克隆本仓库
-   ```bash
-   git clone https://github.com/your-repo/rwkv-v7.git
-   cd rwkv-v7
-   ```
-
-2. 安装依赖
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. 编译CUDA扩展 (可选)
-   ```bash
-   cd cuda
-   python setup.py install
-   ```
-
 ## 文件结构
 ```
 .
